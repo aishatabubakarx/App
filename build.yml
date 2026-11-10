@@ -1,0 +1,665 @@
+name: Build Site Guard APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Write project files
+        run: |
+          mkdir -p app app/src/main app/src/main/assets app/src/main/java/com/siteguard app/src/main/res/values app/src/main/res/xml
+          cat > settings.gradle <<'SGEOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "SiteGuard"
+          include ':app'
+          SGEOF
+          cat > build.gradle <<'SGEOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          SGEOF
+          cat > gradle.properties <<'SGEOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=false
+          SGEOF
+          cat > app/build.gradle <<'SGEOF'
+          plugins { id 'com.android.application' }
+          android {
+              namespace 'com.siteguard'
+              compileSdk 34
+              defaultConfig {
+                  applicationId "com.siteguard"
+                  minSdk 24
+                  targetSdk 33
+                  versionCode 1
+                  versionName "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              lint { abortOnError false }
+          }
+          SGEOF
+          cat > app/src/main/AndroidManifest.xml <<'SGEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"/>
+              <application
+                  android:label="@string/app_name"
+                  android:allowBackup="false"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout|density|uiMode">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".GuardService"
+                      android:exported="true"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService"/>
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config"/>
+                  </service>
+
+                  <receiver
+                      android:name=".AdminReceiver"
+                      android:exported="true"
+                      android:permission="android.permission.BIND_DEVICE_ADMIN">
+                      <meta-data
+                          android:name="android.app.device_admin"
+                          android:resource="@xml/device_admin"/>
+                      <intent-filter>
+                          <action android:name="android.app.action.DEVICE_ADMIN_ENABLED"/>
+                      </intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          SGEOF
+          cat > app/src/main/res/values/strings.xml <<'SGEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">Site Guard</string>
+              <string name="accessibility_desc">Reads the screen to block listed sites and apps and to protect Site Guard from removal.</string>
+          </resources>
+          SGEOF
+          cat > app/src/main/res/xml/accessibility_config.xml <<'SGEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagDefault"
+              android:canRetrieveWindowContent="true"
+              android:notificationTimeout="150"
+              android:description="@string/accessibility_desc"/>
+          SGEOF
+          cat > app/src/main/res/xml/device_admin.xml <<'SGEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <device-admin xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-policies>
+                  <force-lock />
+              </uses-policies>
+          </device-admin>
+          SGEOF
+          cat > app/src/main/java/com/siteguard/AdminReceiver.java <<'SGEOF'
+          package com.siteguard;
+
+          import android.app.admin.DeviceAdminReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+
+          public class AdminReceiver extends DeviceAdminReceiver {
+              @Override
+              public CharSequence onDisableRequested(Context context, Intent intent) {
+                  return "Site Guard needs its PIN to be switched off.";
+              }
+          }
+          SGEOF
+          cat > app/src/main/java/com/siteguard/Store.java <<'SGEOF'
+          package com.siteguard;
+
+          import android.content.Context;
+          import android.content.SharedPreferences;
+          import android.util.Base64;
+
+          import java.security.MessageDigest;
+          import java.security.SecureRandom;
+
+          import javax.crypto.SecretKeyFactory;
+          import javax.crypto.spec.PBEKeySpec;
+
+          public class Store {
+              private static SharedPreferences p(Context c) {
+                  return c.getSharedPreferences("sg", Context.MODE_PRIVATE);
+              }
+
+              static boolean hasPin(Context c) { return p(c).contains("hash"); }
+              static boolean armed(Context c) { return p(c).getBoolean("armed", false); }
+              static void setArmed(Context c, boolean v) { p(c).edit().putBoolean("armed", v).apply(); }
+
+              private static byte[] hash(String pin, byte[] salt) throws Exception {
+                  PBEKeySpec spec = new PBEKeySpec(pin.toCharArray(), salt, 20000, 256);
+                  return SecretKeyFactory.getInstance("PBKDF2WithHmacSHA1").generateSecret(spec).getEncoded();
+              }
+
+              /** Creates a random 8-digit PIN, stores only a salted hash, returns the PIN once. */
+              static String newPin(Context c) {
+                  try {
+                      SecureRandom r = new SecureRandom();
+                      String pin = String.valueOf(10000000 + r.nextInt(90000000));
+                      byte[] salt = new byte[16];
+                      r.nextBytes(salt);
+                      p(c).edit()
+                          .putString("salt", Base64.encodeToString(salt, Base64.NO_WRAP))
+                          .putString("hash", Base64.encodeToString(hash(pin, salt), Base64.NO_WRAP))
+                          .putInt("fails", 0)
+                          .putLong("lock", 0)
+                          .apply();
+                      return pin;
+                  } catch (Exception e) {
+                      throw new RuntimeException(e);
+                  }
+              }
+
+              /** 0 = correct, 1 = wrong, 2 = temporarily locked after too many wrong tries. */
+              static int check(Context c, String pin) {
+                  long now = System.currentTimeMillis();
+                  if (now < p(c).getLong("lock", 0)) return 2;
+                  boolean ok = false;
+                  try {
+                      byte[] salt = Base64.decode(p(c).getString("salt", ""), Base64.NO_WRAP);
+                      String h = Base64.encodeToString(hash(pin, salt), Base64.NO_WRAP);
+                      ok = MessageDigest.isEqual(h.getBytes(), p(c).getString("hash", "").getBytes());
+                  } catch (Exception ignored) { }
+                  SharedPreferences.Editor ed = p(c).edit();
+                  if (ok) {
+                      ed.putInt("fails", 0).apply();
+                      return 0;
+                  }
+                  int f = p(c).getInt("fails", 0) + 1;
+                  if (f >= 3) ed.putInt("fails", 0).putLong("lock", now + 30L * 60 * 1000);
+                  else ed.putInt("fails", f);
+                  ed.apply();
+                  return 1;
+              }
+          }
+          SGEOF
+          cat > app/src/main/java/com/siteguard/MainActivity.java <<'SGEOF'
+          package com.siteguard;
+
+          import android.app.Activity;
+          import android.app.AlertDialog;
+          import android.app.admin.DevicePolicyManager;
+          import android.content.ComponentName;
+          import android.content.Intent;
+          import android.os.Bundle;
+          import android.provider.Settings;
+          import android.text.InputType;
+          import android.view.View;
+          import android.widget.Button;
+          import android.widget.EditText;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          public class MainActivity extends Activity {
+              private LinearLayout root;
+              private String shownPin; // kept only in memory, never saved
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  ScrollView sv = new ScrollView(this);
+                  root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(48, 48, 48, 48);
+                  sv.addView(root);
+                  setContentView(sv);
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  render();
+              }
+
+              private TextView text(String s, int sp, boolean bold) {
+                  TextView t = new TextView(this);
+                  t.setText(s);
+                  t.setTextSize(sp);
+                  t.setPadding(0, 16, 0, 16);
+                  if (bold) t.setTypeface(null, android.graphics.Typeface.BOLD);
+                  return t;
+              }
+
+              private Button button(String label, View.OnClickListener l) {
+                  Button bt = new Button(this);
+                  bt.setText(label);
+                  bt.setOnClickListener(l);
+                  return bt;
+              }
+
+              private boolean accessibilityOn() {
+                  String s = Settings.Secure.getString(getContentResolver(),
+                          Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
+                  return s != null && s.contains(getPackageName());
+              }
+
+              private ComponentName admin() { return new ComponentName(this, AdminReceiver.class); }
+
+              private DevicePolicyManager dpm() {
+                  return (DevicePolicyManager) getSystemService(DEVICE_POLICY_SERVICE);
+              }
+
+              private void render() {
+                  root.removeAllViews();
+                  root.addView(text("Site Guard", 28, true));
+                  if (Store.armed(this)) renderLocked();
+                  else renderSetup();
+              }
+
+              private void renderLocked() {
+                  root.addView(text("Protection is ON.", 20, true));
+                  root.addView(text("Blocked sites and apps are being closed. Removing this app needs the PIN.", 16, false));
+                  final EditText in = new EditText(this);
+                  in.setHint("PIN");
+                  in.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_VARIATION_PASSWORD);
+                  root.addView(in);
+                  root.addView(button("Unlock", v -> {
+                      int r = Store.check(this, in.getText().toString().trim());
+                      if (r == 0) {
+                          Store.setArmed(this, false);
+                          render();
+                      } else if (r == 2) {
+                          Toast.makeText(this, "Too many wrong tries. Try again later.", Toast.LENGTH_LONG).show();
+                      } else {
+                          Toast.makeText(this, "Wrong PIN.", Toast.LENGTH_SHORT).show();
+                      }
+                  }));
+              }
+
+              private void renderSetup() {
+                  if (!Store.hasPin(this)) {
+                      root.addView(text("First make a random 8-digit PIN. It is shown once. After you activate protection it can never be shown again, and protection cannot be switched off without it.", 16, false));
+                      root.addView(button("Generate PIN", v -> {
+                          shownPin = Store.newPin(this);
+                          render();
+                      }));
+                      return;
+                  }
+                  if (shownPin != null) {
+                      root.addView(text("Your PIN (shown only now):", 16, false));
+                      root.addView(text(shownPin, 44, true));
+                  } else {
+                      root.addView(text("A PIN is set but hidden. If you did not keep it and you want to, make a new one before activating.", 16, false));
+                  }
+                  root.addView(button("Make a new PIN", v -> {
+                      shownPin = Store.newPin(this);
+                      render();
+                  }));
+
+                  boolean acc = accessibilityOn();
+                  boolean adm = dpm().isAdminActive(admin());
+
+                  root.addView(text("1. Accessibility service: " + (acc ? "ON" : "OFF"), 18, true));
+                  root.addView(button("Open Accessibility settings (find Site Guard, turn on)", v ->
+                          startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))));
+
+                  root.addView(text("2. Device admin: " + (adm ? "ON" : "OFF"), 18, true));
+                  if (!adm) {
+                      root.addView(button("Activate device admin", v -> {
+                          Intent i = new Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN);
+                          i.putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, admin());
+                          i.putExtra(DevicePolicyManager.EXTRA_ADD_EXPLANATION,
+                                  "Stops Site Guard from being uninstalled without its PIN.");
+                          startActivity(i);
+                      }));
+                  } else {
+                      root.addView(button("Remove device admin (needed before uninstalling)", v -> {
+                          dpm().removeActiveAdmin(admin());
+                          render();
+                      }));
+                  }
+
+                  root.addView(text("3. Battery: allow Site Guard to run in the background", 18, true));
+                  root.addView(button("Open battery settings", v ->
+                          startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))));
+
+                  root.addView(text("4. Activate", 18, true));
+                  root.addView(button("Activate protection", v -> {
+                      if (!accessibilityOn() || !dpm().isAdminActive(admin())) {
+                          Toast.makeText(this, "Finish steps 1 and 2 first.", Toast.LENGTH_LONG).show();
+                          return;
+                      }
+                      new AlertDialog.Builder(this)
+                              .setTitle("Activate protection?")
+                              .setMessage("After this the PIN is hidden for good. Make sure you are happy to lose the ability to switch this off.")
+                              .setPositiveButton("Activate", (d, w) -> {
+                                  Store.setArmed(this, true);
+                                  shownPin = null;
+                                  render();
+                              })
+                              .setNegativeButton("Not yet", null)
+                              .show();
+                  }));
+              }
+          }
+          SGEOF
+          cat > app/src/main/java/com/siteguard/GuardService.java <<'SGEOF'
+          package com.siteguard;
+
+          import android.accessibilityservice.AccessibilityService;
+          import android.content.pm.PackageManager;
+          import android.view.accessibility.AccessibilityEvent;
+          import android.view.accessibility.AccessibilityNodeInfo;
+          import android.widget.Toast;
+
+          import java.io.BufferedReader;
+          import java.io.InputStreamReader;
+          import java.util.ArrayList;
+          import java.util.HashMap;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.Map;
+
+          public class GuardService extends AccessibilityService {
+
+              // Streaming apps: matched by package id or by words in the app's name.
+              private static final String[] APP_IDS = {
+                  "com.netflix.mediaclient", "com.netflix.ninja", "com.amazon.avod.thirdpartyclient",
+                  "com.disney.disneyplus", "com.hulu.plus", "com.wbd.stream", "com.hbo.hbonow",
+                  "com.apple.atve.androidtv.appletv"
+              };
+              private static final String[] APP_WORDS = {
+                  "netflix", "prime video", "disney", "hulu", "showmax", "iroko", "paramount",
+                  "peacock", "tubi", "rakuten viki", "crunchyroll", "iqiyi", "wetv", "kisskh",
+                  "bilibili", "apple tv"
+              };
+              private static final String[] BROWSER_IDS = {
+                  "com.android.chrome", "com.huawei.browser", "org.mozilla.firefox", "org.mozilla.fenix",
+                  "com.opera.browser", "com.opera.mini.native", "com.opera.gx", "com.microsoft.emmx",
+                  "com.brave.browser", "com.duckduckgo.mobile.android", "com.sec.android.app.sbrowser",
+                  "com.UCMobile.intl", "com.uc.browser.en", "mark.via.gp", "com.kiwibrowser.browser",
+                  "com.android.browser", "com.vivaldi.browser", "com.google.android.googlequicksearchbox"
+              };
+              // Screens where the app's own name must never be visible once protection is on.
+              private static final String[] SYSTEM_PARTS = {
+                  "settings", "packageinstaller", "permissioncontroller", "systemmanager",
+                  "securitycenter", "appmarket"
+              };
+
+              private final List<String> tokens = new ArrayList<>();
+              private final Map<String, String> labels = new HashMap<>();
+              private String myLabel = "site guard";
+              private long last = 0;
+              private long lastToast = 0;
+
+              @Override
+              protected void onServiceConnected() {
+                  super.onServiceConnected();
+                  tokens.clear();
+                  try (BufferedReader r = new BufferedReader(new InputStreamReader(getAssets().open("blocklist.txt")))) {
+                      String line;
+                      while ((line = r.readLine()) != null) {
+                          line = line.trim().toLowerCase(Locale.ROOT);
+                          if (!line.isEmpty() && !line.startsWith("#")) tokens.add(line);
+                      }
+                  } catch (Exception ignored) { }
+              }
+
+              @Override
+              public void onAccessibilityEvent(AccessibilityEvent e) {
+                  if (e == null || e.getPackageName() == null) return;
+                  String p = e.getPackageName().toString();
+                  if (p.equals(getPackageName()) || p.equals("com.android.systemui")) return;
+                  int t = e.getEventType();
+                  boolean stateChange = t == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED;
+
+                  if (stateChange && isBlockedApp(p)) {
+                      kick("App blocked");
+                      return;
+                  }
+
+                  long now = System.currentTimeMillis();
+                  if (!stateChange && now - last < 400) return;
+
+                  boolean armed = Store.armed(this);
+                  boolean sys = isSystem(p);
+                  boolean browser = isBrowser(p);
+                  if (!(browser || (armed && (sys || stateChange)))) return;
+                  last = now;
+
+                  AccessibilityNodeInfo root = getRootInActiveWindow();
+                  if (root == null) return;
+                  StringBuilder sb = new StringBuilder();
+                  collect(root, sb, new int[]{0});
+                  String text = sb.toString().toLowerCase(Locale.ROOT);
+
+                  if (armed && text.contains(myLabel) && (sys || text.contains("uninstall"))) {
+                      kick("Protected");
+                      return;
+                  }
+                  if (browser && hit(text)) kick("Site blocked");
+              }
+
+              @Override
+              public void onInterrupt() { }
+
+              private void kick(String msg) {
+                  performGlobalAction(GLOBAL_ACTION_HOME);
+                  long now = System.currentTimeMillis();
+                  if (now - lastToast > 2500) {
+                      lastToast = now;
+                      Toast.makeText(this, msg, Toast.LENGTH_SHORT).show();
+                  }
+              }
+
+              private void collect(AccessibilityNodeInfo n, StringBuilder sb, int[] count) {
+                  if (n == null || count[0]++ > 1200) return;
+                  CharSequence a = n.getText();
+                  CharSequence b = n.getContentDescription();
+                  if (a != null && a.length() < 500) sb.append(a).append('\n');
+                  if (b != null && b.length() < 500) sb.append(b).append('\n');
+                  for (int i = 0; i < n.getChildCount(); i++) collect(n.getChild(i), sb, count);
+              }
+
+              private boolean hit(String text) {
+                  for (String k : tokens) if (text.contains(k)) return true;
+                  return false;
+              }
+
+              private String label(String p) {
+                  String l = labels.get(p);
+                  if (l == null) {
+                      try {
+                          PackageManager pm = getPackageManager();
+                          l = pm.getApplicationLabel(pm.getApplicationInfo(p, 0)).toString().toLowerCase(Locale.ROOT);
+                      } catch (Exception ex) {
+                          l = "";
+                      }
+                      labels.put(p, l);
+                  }
+                  return l;
+              }
+
+              private boolean isBlockedApp(String p) {
+                  for (String id : APP_IDS) if (p.equals(id)) return true;
+                  String l = label(p);
+                  for (String w : APP_WORDS) if (l.contains(w)) return true;
+                  return false;
+              }
+
+              private boolean isBrowser(String p) {
+                  for (String id : BROWSER_IDS) if (p.equals(id)) return true;
+                  String l = label(p);
+                  return l.contains("browser") || l.contains("chrome");
+              }
+
+              private boolean isSystem(String p) {
+                  for (String s : SYSTEM_PARTS) if (p.contains(s)) return true;
+                  return false;
+              }
+          }
+          SGEOF
+          cat > app/src/main/assets/blocklist.txt <<'SGEOF'
+          # One word or domain per line, lowercase. Matched anywhere in what a browser shows.
+          # Edit this list, then rebuild. YouTube and Google are deliberately not listed.
+
+          # --- Streaming-piracy and free movie/series sites ---
+          kisskh
+          dramacool
+          kissasian
+          myasiantv
+          asianembed
+          viewasian
+          watchasian
+          dramanice
+          kdramahood
+          gogoanime
+          9anime
+          hianime
+          aniwatch
+          animepahe
+          fmovies
+          123movies
+          gomovies
+          putlocker
+          soap2day
+          solarmovie
+          yesmovies
+          bflix
+          sflix
+          hdtoday
+          flixtor
+          movie4k
+          myflixer
+          vidsrc
+          lookmovie
+          cuevana
+          primewire
+          1337x
+          thepiratebay
+          piratebay
+          rarbg
+          yts.mx
+          yts.am
+          torrentgalaxy
+          limetorrents
+          nyaa.si
+          fzmovies
+          o2tvseries
+          waploaded
+          netnaija
+          nkiri
+          9jarocks
+          toxicwap
+          bolly4u
+          filmyzilla
+          filmywap
+          moviesda
+          tamilyogi
+          movierulz
+          vegamovies
+          hdhub4u
+          mkvcinemas
+          khatrimaza
+          worldfree4u
+          skymovieshd
+          extramovies
+          mp4moviez
+          okjatt
+          7starhd
+          uwatchfree
+
+          # --- Legal streaming services (website names) ---
+          netflix
+          primevideo
+          disneyplus
+          hulu.com
+          showmax
+          irokotv
+          hbomax
+          tv.apple.com
+          peacocktv
+          paramountplus
+          crunchyroll
+          rakuten viki
+          viki.com
+          iq.com
+          wetv
+          tubitv
+
+          # --- Adult sites and terms ---
+          porn
+          xvideos
+          xnxx
+          xhamster
+          xhaccess
+          redtube
+          youporn
+          spankbang
+          eporner
+          tube8
+          tnaflix
+          drtuber
+          sunporno
+          4tube
+          beeg
+          hqporner
+          txxx
+          hclips
+          daftsex
+          nuvid
+          spankwire
+          motherless
+          brazzers
+          bangbros
+          naughtyamerica
+          onlyfans
+          fapello
+          erome
+          thothub
+          chaturbate
+          stripchat
+          bongacams
+          livejasmin
+          camsoda
+          cam4
+          myfreecams
+          hentai
+          nhentai
+          rule34
+          sex.com
+          SGEOF
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SiteGuard-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
