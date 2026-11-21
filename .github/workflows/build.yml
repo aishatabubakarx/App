@@ -52,6 +52,13 @@ jobs:
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <uses-permission android:name="android.permission.WAKE_LOCK"/>
+              <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT"/>
+              <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM"/>
+              <uses-permission android:name="android.permission.USE_EXACT_ALARM"/>
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
               <application
                   android:label="@string/app_name"
                   android:allowBackup="false"
@@ -91,6 +98,24 @@ jobs:
                           <action android:name="android.app.action.DEVICE_ADMIN_ENABLED"/>
                       </intent-filter>
                   </receiver>
+                  <activity
+                      android:name=".AlarmActivity"
+                      android:exported="false"
+                      android:launchMode="singleTask"
+                      android:excludeFromRecents="true"
+                      android:showWhenLocked="true"
+                      android:turnScreenOn="true"/>
+
+                  <service android:name=".AlarmService" android:exported="false"/>
+
+                  <receiver android:name=".AlarmReceiver" android:exported="false"/>
+
+                  <receiver android:name=".BootReceiver" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.BOOT_COMPLETED"/>
+                          <action android:name="android.intent.action.MY_PACKAGE_REPLACED"/>
+                      </intent-filter>
+                  </receiver>
               </application>
           </manifest>
           SGEOF
@@ -104,11 +129,11 @@ jobs:
           cat > app/src/main/res/xml/accessibility_config.xml <<'SGEOF'
           <?xml version="1.0" encoding="utf-8"?>
           <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
-              android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+              android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeViewTextChanged"
               android:accessibilityFeedbackType="feedbackGeneric"
-              android:accessibilityFlags="flagDefault"
+              android:accessibilityFlags="flagDefault|flagReportViewIds"
               android:canRetrieveWindowContent="true"
-              android:notificationTimeout="150"
+              android:notificationTimeout="100"
               android:description="@string/accessibility_desc"/>
           SGEOF
           cat > app/src/main/res/xml/device_admin.xml <<'SGEOF'
@@ -210,6 +235,7 @@ jobs:
           import android.app.admin.DevicePolicyManager;
           import android.content.ComponentName;
           import android.content.Intent;
+          import android.net.Uri;
           import android.os.Bundle;
           import android.provider.Settings;
           import android.text.InputType;
@@ -234,11 +260,15 @@ jobs:
                   root.setPadding(48, 48, 48, 48);
                   sv.addView(root);
                   setContentView(sv);
+                  if (android.os.Build.VERSION.SDK_INT >= 33) {
+                      requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 1);
+                  }
               }
 
               @Override
               protected void onResume() {
                   super.onResume();
+                  Scheduler.scheduleAll(this);
                   render();
               }
 
@@ -264,6 +294,22 @@ jobs:
                   return s != null && s.contains(getPackageName());
               }
 
+              private void openAppInfo() {
+                  Intent i = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
+                  i.setData(Uri.parse("package:" + getPackageName()));
+                  startActivity(i);
+              }
+
+              private void alarmStatus() {
+                  if (android.os.Build.VERSION.SDK_INT >= 31) {
+                      android.app.AlarmManager am = (android.app.AlarmManager) getSystemService(ALARM_SERVICE);
+                      if (!am.canScheduleExactAlarms()) {
+                          root.addView(text("The prayer alarms need the Alarms and reminders permission.", 16, true));
+                          root.addView(button("Allow alarms", v -> startActivity(new Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM, Uri.parse("package:" + getPackageName())))));
+                      }
+                  }
+              }
+
               private ComponentName admin() { return new ComponentName(this, AdminReceiver.class); }
 
               private DevicePolicyManager dpm() {
@@ -273,6 +319,7 @@ jobs:
               private void render() {
                   root.removeAllViews();
                   root.addView(text("Site Guard", 28, true));
+                  alarmStatus();
                   if (Store.armed(this)) renderLocked();
                   else renderSetup();
               }
@@ -280,6 +327,14 @@ jobs:
               private void renderLocked() {
                   root.addView(text("Protection is ON.", 20, true));
                   root.addView(text("Blocked sites and apps are being closed. Removing this app needs the PIN.", 16, false));
+                  root.addView(text(Schedule.isFreeDay(this)
+                          ? "Today is a screen-time day. Blocking is paused (adult sites stay blocked)."
+                          : "Screen-time days: the 2nd Saturday and the Sunday after it, every month.", 16, false));
+                  if (!accessibilityOn()) {
+                      root.addView(text("Warning: the accessibility service is OFF, so nothing is being blocked right now. Turn it back on.", 16, true));
+                      root.addView(button("Open Accessibility settings", v -> startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))));
+                  }
+                  root.addView(button("Phone keeps stopping Site Guard? Open app settings", v -> openAppInfo()));
                   final EditText in = new EditText(this);
                   in.setHint("PIN");
                   in.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_VARIATION_PASSWORD);
@@ -343,6 +398,7 @@ jobs:
                   root.addView(text("3. Battery: allow Site Guard to run in the background", 18, true));
                   root.addView(button("Open battery settings", v ->
                           startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))));
+                  root.addView(button("Open app settings (set battery to Unrestricted, allow auto-start)", v -> openAppInfo()));
 
                   root.addView(text("4. Activate", 18, true));
                   root.addView(button("Activate protection", v -> {
@@ -368,22 +424,41 @@ jobs:
           package com.siteguard;
 
           import android.accessibilityservice.AccessibilityService;
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.IntentFilter;
           import android.content.pm.PackageManager;
+          import android.graphics.Color;
+          import android.graphics.PixelFormat;
+          import android.graphics.Rect;
+          import android.os.Build;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.view.Gravity;
+          import android.view.ViewGroup;
+          import android.view.WindowManager;
           import android.view.accessibility.AccessibilityEvent;
           import android.view.accessibility.AccessibilityNodeInfo;
+          import android.widget.TextView;
           import android.widget.Toast;
 
           import java.io.BufferedReader;
           import java.io.InputStreamReader;
           import java.util.ArrayList;
           import java.util.HashMap;
+          import java.util.HashSet;
           import java.util.List;
           import java.util.Locale;
           import java.util.Map;
+          import java.util.Set;
 
           public class GuardService extends AccessibilityService {
 
-              // Streaming apps: matched by package id or by words in the app's name.
+              // Streaming apps: closed straight away, matched by package id or by words in the app's name.
               private static final String[] APP_IDS = {
                   "com.netflix.mediaclient", "com.netflix.ninja", "com.amazon.avod.thirdpartyclient",
                   "com.disney.disneyplus", "com.hulu.plus", "com.wbd.stream", "com.hbo.hbonow",
@@ -401,28 +476,122 @@ jobs:
                   "com.UCMobile.intl", "com.uc.browser.en", "mark.via.gp", "com.kiwibrowser.browser",
                   "com.android.browser", "com.vivaldi.browser", "com.google.android.googlequicksearchbox"
               };
+              // TikTok and Instagram: only the names at the top of the screen and the search box are checked.
+              private static final String[] SOCIAL_IDS = {
+                  "com.zhiliaoapp.musically", "com.ss.android.ugc.trill", "com.zhiliaoapp.musically.go",
+                  "com.instagram.android", "com.instagram.lite"
+              };
+              // Where browsers keep the address / search bar (appended to the browser's package id).
+              private static final String[] BAR_IDS = {
+                  "url_bar", "search_box_text", "mozac_browser_toolbar_url_view", "url_field",
+                  "location_bar_edit_text", "omnibarTextInput", "url"
+              };
               // Screens where the app's own name must never be visible once protection is on.
               private static final String[] SYSTEM_PARTS = {
                   "settings", "packageinstaller", "permissioncontroller", "systemmanager",
                   "securitycenter", "appmarket"
               };
 
-              private final List<String> tokens = new ArrayList<>();
+              private final List<String> webWords = new ArrayList<>();   // blocklist.txt, paused on screen-time days
+              private final List<String> alwaysWords = new ArrayList<>(); // blocklist.txt after #!always, never paused
+              private final List<String> nameWords = new ArrayList<>();  // names.txt, matched anywhere
+              private final Set<String> nameExact = new HashSet<>();     // names.txt, lines starting with =
               private final Map<String, String> labels = new HashMap<>();
+              private final Handler h = new Handler(Looper.getMainLooper());
               private String myLabel = "site guard";
-              private long last = 0;
+
+              // First unlock of the day shows the morning screen.
+              private final BroadcastReceiver unlock = new BroadcastReceiver() {
+                  @Override public void onReceive(Context c, Intent i) {
+                      if (Content.morningDue(GuardService.this)) {
+                          Content.markMorning(GuardService.this);
+                          MorningScreen.show(GuardService.this);
+                      }
+                  }
+              };
+
+              // event handling
+              private String lastPkg = null;
+              private boolean pending = false;
+              private boolean pendingState = false;
+              private int nullRetries = 0;
               private long lastToast = 0;
+
+              // warning countdown
+              private boolean warning = false;
+              private boolean warnBrowser = false;
+              private String warnPkg = null;
+              private int secs = 0;
+              private int stage = 0;
+              private WindowManager wm = null;
+              private TextView banner = null;
+
+              private final Runnable check = new Runnable() {
+                  @Override public void run() { runCheck(); }
+              };
+              private final Runnable tick = new Runnable() {
+                  @Override public void run() { runTick(); }
+              };
 
               @Override
               protected void onServiceConnected() {
                   super.onServiceConnected();
-                  tokens.clear();
-                  try (BufferedReader r = new BufferedReader(new InputStreamReader(getAssets().open("blocklist.txt")))) {
+                  webWords.clear();
+                  alwaysWords.clear();
+                  nameWords.clear();
+                  nameExact.clear();
+                  loadList("blocklist.txt", webWords, null);
+                  loadList("names.txt", nameWords, nameExact);
+                  keepAlive();
+                  try {
+                      registerReceiver(unlock, new IntentFilter(Intent.ACTION_USER_PRESENT));
+                  } catch (Exception ignored) { }
+                  Scheduler.scheduleAll(this);
+              }
+
+              @Override
+              public void onDestroy() {
+                  h.removeCallbacksAndMessages(null);
+                  removeBanner();
+                  try { unregisterReceiver(unlock); } catch (Exception ignored) { }
+                  super.onDestroy();
+              }
+
+              private void loadList(String asset, List<String> words, Set<String> exact) {
+                  try (BufferedReader r = new BufferedReader(new InputStreamReader(getAssets().open(asset)))) {
                       String line;
+                      boolean always = false;
                       while ((line = r.readLine()) != null) {
                           line = line.trim().toLowerCase(Locale.ROOT);
-                          if (!line.isEmpty() && !line.startsWith("#")) tokens.add(line);
+                          if (line.equals("#!always")) { always = true; continue; }
+                          if (line.isEmpty() || line.startsWith("#")) continue;
+                          if (exact != null && line.startsWith("=")) {
+                              String e = line.substring(1).trim();
+                              if (!e.isEmpty()) exact.add(e);
+                          } else if (always && exact == null) {
+                              alwaysWords.add(line);
+                          } else {
+                              words.add(line);
+                          }
                       }
+                  } catch (Exception ignored) { }
+              }
+
+              // A quiet ongoing notification makes the phone far less likely to stop this service.
+              private void keepAlive() {
+                  try {
+                      NotificationManager nm = getSystemService(NotificationManager.class);
+                      Notification.Builder b;
+                      if (Build.VERSION.SDK_INT >= 26) {
+                          nm.createNotificationChannel(new NotificationChannel("sg", "Site Guard", NotificationManager.IMPORTANCE_MIN));
+                          b = new Notification.Builder(this, "sg");
+                      } else {
+                          b = new Notification.Builder(this);
+                      }
+                      b.setContentTitle("Site Guard is on")
+                       .setSmallIcon(android.R.drawable.ic_lock_idle_lock)
+                       .setOngoing(true);
+                      startForeground(1, b.build());
                   } catch (Exception ignored) { }
               }
 
@@ -431,38 +600,234 @@ jobs:
                   if (e == null || e.getPackageName() == null) return;
                   String p = e.getPackageName().toString();
                   if (p.equals(getPackageName()) || p.equals("com.android.systemui")) return;
-                  int t = e.getEventType();
-                  boolean stateChange = t == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED;
+                  boolean stateChange = e.getEventType() == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED;
 
-                  if (stateChange && isBlockedApp(p)) {
+                  if (stateChange && !Schedule.isFreeDay(this) && isBlockedApp(p)) {
                       kick("App blocked");
                       return;
                   }
 
-                  long now = System.currentTimeMillis();
-                  if (!stateChange && now - last < 400) return;
+                  lastPkg = p;
+                  if (stateChange) pendingState = true;
+                  // Check at most every 150 ms, but never skip a check: the timer is not reset by new events.
+                  if (!pending) {
+                      pending = true;
+                      h.postDelayed(check, 150);
+                  }
+              }
+
+              private void runCheck() {
+                  pending = false;
+                  boolean state = pendingState;
+                  pendingState = false;
+
+                  AccessibilityNodeInfo root = getRootInActiveWindow();
+                  if (root == null) {
+                      // Browsers often have no content for a moment while a page loads. Try again shortly.
+                      if (nullRetries++ < 6) {
+                          pending = true;
+                          pendingState = pendingState || state;
+                          h.postDelayed(check, 300);
+                      }
+                      return;
+                  }
+                  nullRetries = 0;
+
+                  CharSequence cp = root.getPackageName();
+                  if (cp == null) return;
+                  String p = cp.toString();
+                  if (p.equals(getPackageName()) || p.equals("com.android.systemui")) return;
 
                   boolean armed = Store.armed(this);
                   boolean sys = isSystem(p);
-                  boolean browser = isBrowser(p);
-                  if (!(browser || (armed && (sys || stateChange)))) return;
-                  last = now;
 
-                  AccessibilityNodeInfo root = getRootInActiveWindow();
-                  if (root == null) return;
-                  StringBuilder sb = new StringBuilder();
-                  collect(root, sb, new int[]{0});
-                  String text = sb.toString().toLowerCase(Locale.ROOT);
-
-                  if (armed && text.contains(myLabel) && (sys || text.contains("uninstall"))) {
-                      kick("Protected");
-                      return;
+                  if (armed && (sys || state)) {
+                      StringBuilder sb = new StringBuilder();
+                      collect(root, sb, new int[]{0});
+                      String text = sb.toString().toLowerCase(Locale.ROOT);
+                      if (text.contains(myLabel) && (sys || text.contains("uninstall"))) {
+                          kick("Protected");
+                          return;
+                      }
                   }
-                  if (browser && hit(text)) kick("Site blocked");
+
+                  if (isBrowser(p)) {
+                      if (browserHit(root, p)) startWarning(p, true);
+                  } else if (isSocial(p)) {
+                      if (socialHit(root)) startWarning(p, false);
+                  }
               }
 
-              @Override
-              public void onInterrupt() { }
+              // ---------- what to look at ----------
+
+              private boolean browserHit(AccessibilityNodeInfo root, String p) {
+                  String bar = barText(root, p);
+                  if (bar == null) return false;
+                  return matches(bar, true);
+              }
+
+              private boolean socialHit(AccessibilityNodeInfo root) {
+                  int top = (int) (getResources().getDisplayMetrics().heightPixels * 0.25f);
+                  List<String> found = new ArrayList<>();
+                  collectTop(root, found, new int[]{0}, top);
+                  for (String s : found) if (matches(s, false)) return true;
+                  return false;
+              }
+
+              private String barText(AccessibilityNodeInfo root, String p) {
+                  for (String id : BAR_IDS) {
+                      List<AccessibilityNodeInfo> list = root.findAccessibilityNodeInfosByViewId(p + ":id/" + id);
+                      if (list == null) continue;
+                      for (AccessibilityNodeInfo n : list) {
+                          CharSequence t = n.getText();
+                          if (t != null && t.length() > 0) return t.toString();
+                      }
+                  }
+                  // Browser we do not know: use the first text box near the top of the screen.
+                  int top = (int) (getResources().getDisplayMetrics().heightPixels * 0.3f);
+                  return editText(root, new int[]{0}, top);
+              }
+
+              private String editText(AccessibilityNodeInfo n, int[] count, int maxTop) {
+                  if (n == null || count[0]++ > 800) return null;
+                  if (!n.isVisibleToUser()) return null;
+                  CharSequence cls = n.getClassName();
+                  if (cls != null && cls.toString().contains("EditText")) {
+                      CharSequence t = n.getText();
+                      Rect r = new Rect();
+                      n.getBoundsInScreen(r);
+                      if (t != null && t.length() > 0 && r.top < maxTop) return t.toString();
+                  }
+                  for (int i = 0; i < n.getChildCount(); i++) {
+                      String s = editText(n.getChild(i), count, maxTop);
+                      if (s != null) return s;
+                  }
+                  return null;
+              }
+
+              private void collectTop(AccessibilityNodeInfo n, List<String> out, int[] count, int maxTop) {
+                  if (n == null || count[0]++ > 600) return;
+                  if (!n.isVisibleToUser()) return;
+                  Rect r = new Rect();
+                  n.getBoundsInScreen(r);
+                  if (r.top >= maxTop) return;
+                  // Only small labels that sit fully inside the top part of the screen count.
+                  if (r.bottom <= maxTop) {
+                      CharSequence a = n.getText();
+                      CharSequence b = n.getContentDescription();
+                      if (a != null && a.length() < 200) out.add(a.toString());
+                      if (b != null && b.length() < 200) out.add(b.toString());
+                  }
+                  for (int i = 0; i < n.getChildCount(); i++) collectTop(n.getChild(i), out, count, maxTop);
+              }
+
+              private boolean matches(String raw, boolean web) {
+                  String t = raw.toLowerCase(Locale.ROOT).trim();
+                  if (t.isEmpty()) return false;
+                  for (String k : alwaysWords) if (t.contains(k)) return true;
+                  // On screen-time days everything else is paused.
+                  if (Schedule.isFreeDay(this)) return false;
+                  String bare = t.startsWith("@") ? t.substring(1) : t;
+                  if (nameExact.contains(t) || nameExact.contains(bare)) return true;
+                  for (String k : nameWords) if (t.contains(k)) return true;
+                  if (web) for (String k : webWords) if (t.contains(k)) return true;
+                  return false;
+              }
+
+              // ---------- the 5 second warning ----------
+
+              private void startWarning(String pkg, boolean browser) {
+                  if (warning) return;
+                  warning = true;
+                  warnPkg = pkg;
+                  warnBrowser = browser;
+                  secs = 5;
+                  stage = 0;
+                  showBanner();
+                  h.removeCallbacks(tick);
+                  h.postDelayed(tick, 1000);
+              }
+
+              private boolean stillBlocked() {
+                  AccessibilityNodeInfo root = getRootInActiveWindow();
+                  if (root == null) return true;
+                  CharSequence cp = root.getPackageName();
+                  if (cp == null) return true;
+                  String p = cp.toString();
+                  if (p.equals(getPackageName()) || p.equals("com.android.systemui")) return true;
+                  if (!p.equals(warnPkg)) return false;
+                  return warnBrowser ? browserHit(root, p) : socialHit(root);
+              }
+
+              private void runTick() {
+                  if (!warning) return;
+                  if (!stillBlocked()) {
+                      stopWarning();
+                      return;
+                  }
+                  secs--;
+                  if (secs > 0) {
+                      setBanner("Blocked. Close this page within " + secs + " seconds or Site Guard will take you out.");
+                      h.postDelayed(tick, 1000);
+                      return;
+                  }
+                  if (warnBrowser && stage == 0) {
+                      stage = 1;
+                      secs = 1;
+                      setBanner("Going back...");
+                      performGlobalAction(GLOBAL_ACTION_BACK);
+                      h.postDelayed(tick, 1500);
+                      return;
+                  }
+                  stopWarning();
+                  kick("Blocked");
+              }
+
+              private void stopWarning() {
+                  warning = false;
+                  h.removeCallbacks(tick);
+                  removeBanner();
+              }
+
+              private void showBanner() {
+                  try {
+                      wm = (WindowManager) getSystemService(WINDOW_SERVICE);
+                      float d = getResources().getDisplayMetrics().density;
+                      banner = new TextView(this);
+                      banner.setTextColor(Color.WHITE);
+                      banner.setBackgroundColor(0xEEB00020);
+                      banner.setTextSize(16);
+                      banner.setGravity(Gravity.CENTER);
+                      banner.setPadding((int) (16 * d), (int) (40 * d), (int) (16 * d), (int) (14 * d));
+                      banner.setText("Blocked. Close this page within 5 seconds or Site Guard will take you out.");
+                      WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
+                              ViewGroup.LayoutParams.MATCH_PARENT,
+                              ViewGroup.LayoutParams.WRAP_CONTENT,
+                              WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                              WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                                      | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                                      | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                              PixelFormat.TRANSLUCENT);
+                      lp.gravity = Gravity.TOP;
+                      wm.addView(banner, lp);
+                  } catch (Exception ex) {
+                      banner = null;
+                      Toast.makeText(this, "Blocked. Leave this page in 5 seconds.", Toast.LENGTH_LONG).show();
+                  }
+              }
+
+              private void setBanner(String s) {
+                  if (banner != null) banner.setText(s);
+              }
+
+              private void removeBanner() {
+                  try {
+                      if (wm != null && banner != null) wm.removeView(banner);
+                  } catch (Exception ignored) { }
+                  banner = null;
+              }
+
+              // ---------- helpers ----------
 
               private void kick(String msg) {
                   performGlobalAction(GLOBAL_ACTION_HOME);
@@ -473,18 +838,16 @@ jobs:
                   }
               }
 
+              @Override
+              public void onInterrupt() { }
+
               private void collect(AccessibilityNodeInfo n, StringBuilder sb, int[] count) {
-                  if (n == null || count[0]++ > 1200) return;
+                  if (n == null || count[0]++ > 1500) return;
                   CharSequence a = n.getText();
                   CharSequence b = n.getContentDescription();
                   if (a != null && a.length() < 500) sb.append(a).append('\n');
                   if (b != null && b.length() < 500) sb.append(b).append('\n');
                   for (int i = 0; i < n.getChildCount(); i++) collect(n.getChild(i), sb, count);
-              }
-
-              private boolean hit(String text) {
-                  for (String k : tokens) if (text.contains(k)) return true;
-                  return false;
               }
 
               private String label(String p) {
@@ -512,6 +875,12 @@ jobs:
                   for (String id : BROWSER_IDS) if (p.equals(id)) return true;
                   String l = label(p);
                   return l.contains("browser") || l.contains("chrome");
+              }
+
+              private boolean isSocial(String p) {
+                  for (String id : SOCIAL_IDS) if (p.equals(id)) return true;
+                  String l = label(p);
+                  return l.contains("tiktok") || l.contains("instagram");
               }
 
               private boolean isSystem(String p) {
@@ -608,7 +977,8 @@ jobs:
           wetv
           tubitv
 
-          # --- Adult sites and terms ---
+          #!always
+          # --- Adult sites and terms (these stay blocked on screen-time days; delete the line above to pause them too) ---
           porn
           xvideos
           xnxx
@@ -650,6 +1020,668 @@ jobs:
           rule34
           sex.com
           SGEOF
+          cat > app/src/main/java/com/siteguard/Schedule.java <<'SGEOF'
+          package com.siteguard;
+
+          import android.content.Context;
+          import android.provider.Settings;
+
+          import java.util.Calendar;
+
+          final class Schedule {
+              private Schedule() { }
+
+              /** Screen-time days: the 2nd Saturday of each month and the Sunday after it. */
+              static boolean isFreeDate(Calendar cal) {
+                  int dow = cal.get(Calendar.DAY_OF_WEEK);
+                  int dom = cal.get(Calendar.DAY_OF_MONTH);
+                  if (dow == Calendar.SATURDAY && dom >= 8 && dom <= 14) return true;
+                  return dow == Calendar.SUNDAY && dom >= 9 && dom <= 15;
+              }
+
+              static boolean isFreeDay(Context c) {
+                  try {
+                      // If the phone's date is set by hand, the date cannot be trusted, so no free day.
+                      if (Settings.Global.getInt(c.getContentResolver(), Settings.Global.AUTO_TIME, 1) == 0) return false;
+                  } catch (Exception ignored) { }
+                  return isFreeDate(Calendar.getInstance());
+              }
+          }
+          SGEOF
+          cat > app/src/main/java/com/siteguard/Scheduler.java <<'SGEOF'
+          package com.siteguard;
+
+          import android.app.AlarmManager;
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.os.Build;
+
+          import java.util.Calendar;
+
+          final class Scheduler {
+              private Scheduler() { }
+
+              static final int TAHAJJUD = 1;
+              static final int FAJR = 2;
+              static final int NOTICE = 3;
+
+              static final String ACT_RING = "com.siteguard.RING";
+              static final String ACT_NOTICE = "com.siteguard.NOTICE";
+
+              // Change these to move the alarms.
+              static final int TAHAJJUD_H = 4, TAHAJJUD_M = 10;
+              static final int FAJR_H = 5, FAJR_M = 20;
+              // The reminder before a screen-time day goes out at this hour the evening before.
+              static final int NOTICE_H = 20;
+
+              static void scheduleAll(Context c) {
+                  setRing(c, TAHAJJUD, next(TAHAJJUD_H, TAHAJJUD_M), TAHAJJUD);
+                  setRing(c, FAJR, next(FAJR_H, FAJR_M), FAJR);
+                  long n = nextNotice();
+                  if (n > 0) setNotice(c, n);
+              }
+
+              static void snooze(Context c, int kind) {
+                  setRing(c, kind, System.currentTimeMillis() + 5 * 60 * 1000L, 100 + kind);
+              }
+
+              private static long next(int h, int m) {
+                  Calendar t = Calendar.getInstance();
+                  t.set(Calendar.HOUR_OF_DAY, h);
+                  t.set(Calendar.MINUTE, m);
+                  t.set(Calendar.SECOND, 0);
+                  t.set(Calendar.MILLISECOND, 0);
+                  if (t.getTimeInMillis() <= System.currentTimeMillis()) t.add(Calendar.DAY_OF_MONTH, 1);
+                  return t.getTimeInMillis();
+              }
+
+              private static long nextNotice() {
+                  Calendar d = Calendar.getInstance();
+                  for (int i = 0; i < 70; i++) {
+                      int dom = d.get(Calendar.DAY_OF_MONTH);
+                      if (d.get(Calendar.DAY_OF_WEEK) == Calendar.SATURDAY && dom >= 8 && dom <= 14) {
+                          Calendar n = (Calendar) d.clone();
+                          n.add(Calendar.DAY_OF_MONTH, -1);
+                          n.set(Calendar.HOUR_OF_DAY, NOTICE_H);
+                          n.set(Calendar.MINUTE, 0);
+                          n.set(Calendar.SECOND, 0);
+                          n.set(Calendar.MILLISECOND, 0);
+                          if (n.getTimeInMillis() > System.currentTimeMillis()) return n.getTimeInMillis();
+                      }
+                      d.add(Calendar.DAY_OF_MONTH, 1);
+                  }
+                  return -1;
+              }
+
+              private static PendingIntent pi(Context c, int kind, int req, String action) {
+                  Intent i = new Intent(c, AlarmReceiver.class).setAction(action).putExtra("kind", kind);
+                  return PendingIntent.getBroadcast(c, req, i, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+              }
+
+              private static void setRing(Context c, int kind, long at, int req) {
+                  AlarmManager am = (AlarmManager) c.getSystemService(Context.ALARM_SERVICE);
+                  PendingIntent p = pi(c, kind, req, ACT_RING);
+                  PendingIntent show = PendingIntent.getActivity(c, 50, new Intent(c, MainActivity.class),
+                          PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+                  try {
+                      am.setAlarmClock(new AlarmManager.AlarmClockInfo(at, show), p);
+                  } catch (SecurityException e) {
+                      am.set(AlarmManager.RTC_WAKEUP, at, p);
+                  }
+              }
+
+              private static void setNotice(Context c, long at) {
+                  AlarmManager am = (AlarmManager) c.getSystemService(Context.ALARM_SERVICE);
+                  PendingIntent p = pi(c, NOTICE, NOTICE, ACT_NOTICE);
+                  try {
+                      am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, p);
+                  } catch (SecurityException e) {
+                      am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, p);
+                  }
+              }
+
+              static void showNotice(Context c) {
+                  NotificationManager nm = c.getSystemService(NotificationManager.class);
+                  Notification.Builder b;
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      nm.createNotificationChannel(new NotificationChannel("notice", "Screen-time reminder", NotificationManager.IMPORTANCE_DEFAULT));
+                      b = new Notification.Builder(c, "notice");
+                  } else {
+                      b = new Notification.Builder(c);
+                  }
+                  b.setContentTitle("Screen time tomorrow")
+                   .setContentText("Hey, you've got screen time tomorrow (Saturday and Sunday). Blocking is paused until Monday.")
+                   .setStyle(new Notification.BigTextStyle().bigText("Hey, you've got screen time tomorrow (Saturday and Sunday). Blocking is paused until Monday."))
+                   .setSmallIcon(android.R.drawable.ic_dialog_info)
+                   .setAutoCancel(true);
+                  nm.notify(3, b.build());
+              }
+          }
+          SGEOF
+          cat > app/src/main/java/com/siteguard/AlarmReceiver.java <<'SGEOF'
+          package com.siteguard;
+
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.os.Build;
+
+          public class AlarmReceiver extends BroadcastReceiver {
+              @Override
+              public void onReceive(Context c, Intent i) {
+                  String a = i.getAction();
+                  int kind = i.getIntExtra("kind", Scheduler.TAHAJJUD);
+                  if (Scheduler.ACT_NOTICE.equals(a)) {
+                      Scheduler.showNotice(c);
+                  } else if (Scheduler.ACT_RING.equals(a)) {
+                      Intent s = new Intent(c, AlarmService.class).putExtra("kind", kind);
+                      if (Build.VERSION.SDK_INT >= 26) c.startForegroundService(s);
+                      else c.startService(s);
+                  }
+                  // Line up tomorrow's alarms.
+                  Scheduler.scheduleAll(c);
+              }
+          }
+          SGEOF
+          cat > app/src/main/java/com/siteguard/BootReceiver.java <<'SGEOF'
+          package com.siteguard;
+
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+
+          public class BootReceiver extends BroadcastReceiver {
+              @Override
+              public void onReceive(Context c, Intent i) {
+                  Scheduler.scheduleAll(c);
+              }
+          }
+          SGEOF
+          cat > app/src/main/java/com/siteguard/AlarmService.java <<'SGEOF'
+          package com.siteguard;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Service;
+          import android.content.Intent;
+          import android.content.res.AssetFileDescriptor;
+          import android.media.AudioAttributes;
+          import android.media.AudioManager;
+          import android.media.MediaPlayer;
+          import android.media.RingtoneManager;
+          import android.os.Build;
+          import android.os.Handler;
+          import android.os.IBinder;
+          import android.os.Looper;
+
+          public class AlarmService extends Service {
+              private MediaPlayer mp;
+              private final Handler h = new Handler(Looper.getMainLooper());
+
+              @Override
+              public IBinder onBind(Intent intent) { return null; }
+
+              @Override
+              public int onStartCommand(Intent intent, int flags, int startId) {
+                  int kind = intent == null ? Scheduler.TAHAJJUD : intent.getIntExtra("kind", Scheduler.TAHAJJUD);
+                  showNotification(kind);
+                  startSound();
+                  h.removeCallbacksAndMessages(null);
+                  // Stop by itself after 15 minutes if nobody answers.
+                  h.postDelayed(() -> stopSelf(), 15 * 60 * 1000L);
+                  return START_NOT_STICKY;
+              }
+
+              private void showNotification(int kind) {
+                  NotificationManager nm = getSystemService(NotificationManager.class);
+                  Notification.Builder b;
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      NotificationChannel ch = new NotificationChannel("alarm", "Prayer alarms", NotificationManager.IMPORTANCE_HIGH);
+                      ch.setSound(null, null);
+                      nm.createNotificationChannel(ch);
+                      b = new Notification.Builder(this, "alarm");
+                  } else {
+                      b = new Notification.Builder(this);
+                  }
+                  Intent open = new Intent(this, AlarmActivity.class)
+                          .putExtra("kind", kind)
+                          .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                  PendingIntent pi = PendingIntent.getActivity(this, 7, open,
+                          PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+                  b.setContentTitle(kind == Scheduler.FAJR ? "Time to wake up for Fajr" : "Time for Tahajjud")
+                   .setContentText("Tap to open")
+                   .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
+                   .setCategory(Notification.CATEGORY_ALARM)
+                   .setOngoing(true)
+                   .setContentIntent(pi)
+                   .setFullScreenIntent(pi, true);
+                  startForeground(2, b.build());
+                  try {
+                      startActivity(open);
+                  } catch (Exception ignored) { }
+              }
+
+              private void startSound() {
+                  stopSound();
+                  try {
+                      AudioManager am = (AudioManager) getSystemService(AUDIO_SERVICE);
+                      int max = am.getStreamMaxVolume(AudioManager.STREAM_ALARM);
+                      if (am.getStreamVolume(AudioManager.STREAM_ALARM) < max * 0.6) {
+                          am.setStreamVolume(AudioManager.STREAM_ALARM, (int) (max * 0.8), 0);
+                      }
+                  } catch (Exception ignored) { }
+                  mp = new MediaPlayer();
+                  try {
+                      mp.setAudioAttributes(new AudioAttributes.Builder()
+                              .setUsage(AudioAttributes.USAGE_ALARM)
+                              .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                              .build());
+                      int id = getResources().getIdentifier("adhan", "raw", getPackageName());
+                      if (id != 0) {
+                          AssetFileDescriptor afd = getResources().openRawResourceFd(id);
+                          mp.setDataSource(afd.getFileDescriptor(), afd.getStartOffset(), afd.getLength());
+                          afd.close();
+                      } else {
+                          mp.setDataSource(this, RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM));
+                      }
+                      mp.setLooping(true);
+                      mp.prepare();
+                      mp.start();
+                  } catch (Exception e) {
+                      stopSound();
+                  }
+              }
+
+              private void stopSound() {
+                  if (mp != null) {
+                      try { mp.stop(); } catch (Exception ignored) { }
+                      try { mp.release(); } catch (Exception ignored) { }
+                      mp = null;
+                  }
+              }
+
+              @Override
+              public void onDestroy() {
+                  h.removeCallbacksAndMessages(null);
+                  stopSound();
+                  super.onDestroy();
+              }
+          }
+          SGEOF
+          cat > app/src/main/java/com/siteguard/AlarmActivity.java <<'SGEOF'
+          package com.siteguard;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.os.Bundle;
+          import android.view.WindowManager;
+          import android.widget.Button;
+
+          public class AlarmActivity extends Activity {
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
+                          | WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+                          | WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+                          | WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD);
+                  final int kind = getIntent().getIntExtra("kind", Scheduler.TAHAJJUD);
+
+                  Button up = new Button(this);
+                  up.setText("I'm up");
+                  up.setOnClickListener(v -> {
+                      stopService(new Intent(this, AlarmService.class));
+                      finish();
+                  });
+                  Button snooze = new Button(this);
+                  snooze.setText("Snooze 5 minutes");
+                  snooze.setOnClickListener(v -> {
+                      Scheduler.snooze(this, kind);
+                      stopService(new Intent(this, AlarmService.class));
+                      finish();
+                  });
+                  setContentView(Content.screen(this, kind, up, snooze));
+              }
+
+              // The alarm cannot be dismissed with the back button. Tap "I'm up" or snooze.
+              @Override
+              public void onBackPressed() { }
+          }
+          SGEOF
+          cat > app/src/main/java/com/siteguard/MorningScreen.java <<'SGEOF'
+          package com.siteguard;
+
+          import android.accessibilityservice.AccessibilityService;
+          import android.content.Context;
+          import android.graphics.PixelFormat;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.view.WindowManager;
+          import android.widget.Button;
+
+          final class MorningScreen {
+              private MorningScreen() { }
+
+              private static View shown = null;
+
+              static void show(final AccessibilityService svc) {
+                  if (shown != null) return;
+                  try {
+                      final WindowManager wm = (WindowManager) svc.getSystemService(Context.WINDOW_SERVICE);
+                      final Button b = new Button(svc);
+                      b.setEnabled(false);
+                      b.setText("Take a moment... (8)");
+                      final View v = Content.screen(svc, Content.MORNING, b);
+                      WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
+                              ViewGroup.LayoutParams.MATCH_PARENT,
+                              ViewGroup.LayoutParams.MATCH_PARENT,
+                              WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                              WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                              PixelFormat.OPAQUE);
+                      wm.addView(v, lp);
+                      shown = v;
+
+                      final Handler h = new Handler(Looper.getMainLooper());
+                      final int[] left = {8};
+                      h.postDelayed(new Runnable() {
+                          @Override public void run() {
+                              left[0]--;
+                              if (left[0] > 0) {
+                                  b.setText("Take a moment... (" + left[0] + ")");
+                                  h.postDelayed(this, 1000);
+                              } else {
+                                  b.setText("Continue");
+                                  b.setEnabled(true);
+                              }
+                          }
+                      }, 1000);
+                      b.setOnClickListener(x -> {
+                          try { wm.removeView(v); } catch (Exception ignored) { }
+                          shown = null;
+                      });
+                  } catch (Exception e) {
+                      shown = null;
+                  }
+              }
+          }
+          SGEOF
+          cat > app/src/main/java/com/siteguard/Content.java <<'SGEOF'
+          package com.siteguard;
+
+          import android.content.Context;
+          import android.graphics.Typeface;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+
+          import java.util.Calendar;
+
+          /** Words shown on the morning screen and on the prayer alarms. Edit freely. */
+          final class Content {
+              private Content() { }
+
+              static final int MORNING = 0;
+              static final int TAHAJJUD = 1;
+              static final int FAJR = 2;
+
+              // Meanings of hadith, each with its reference. Please check these against your own books.
+              static final String[][] HADITH = {
+                  {"No tiredness, illness, worry, sadness, harm or distress touches a believer, not even a thorn that pricks him, except that Allah removes some of his sins because of it.", "Bukhari 5641, Muslim 2573"},
+                  {"How wonderful is the situation of the believer, all of it is good for him. If something good happens he is grateful, and that is good for him. If something harmful happens he is patient, and that is good for him.", "Muslim 2999"},
+                  {"Allah the Exalted says: I am as My servant expects Me to be, and I am with him when he remembers Me.", "Bukhari 7405, Muslim 2675"},
+                  {"The greatest reward comes with the greatest trial. When Allah loves a people, He tests them. Whoever is pleased with it earns His pleasure.", "Tirmidhi 2396, graded hasan"},
+                  {"When Allah wants good for someone, He lets him go through trials.", "Bukhari 5645"},
+                  {"The strong believer is better and more beloved to Allah than the weak believer, though both have good. Hold on to what benefits you, ask Allah for help, and do not give up. If something hits you, do not say 'if only I had done this', but say: Allah decreed it, and what He wills, He does.", "Muslim 2664"},
+                  {"Be mindful of Allah and He will protect you. Be mindful of Allah and you will find Him in front of you. If you ask, ask Allah. If you seek help, seek help from Allah.", "Tirmidhi 2516, graded hasan sahih"},
+                  {"Every son of Adam makes mistakes, and the best of those who make mistakes are those who turn back to Allah.", "Tirmidhi 2499, graded hasan"},
+                  {"Allah is more merciful to His servants than this mother is to her child.", "Bukhari 5999, Muslim 2754"},
+              };
+
+              static final String[][] TAHAJJUD_HADITH = {
+                  {"Our Lord descends every night to the lowest heaven when the last third of the night remains. He says: Who is calling on Me, so I may answer him? Who is asking Me, so I may give him? Who is asking My forgiveness, so I may forgive him?", "Bukhari 1145, Muslim 758"},
+              };
+
+              static final String[][] FAJR_HADITH = {
+                  {"Whoever prays Fajr is under the protection of Allah.", "Muslim 657"},
+                  {"The two rak'ahs of Fajr are better than this world and everything in it.", "Muslim 725"},
+              };
+
+              static final String[] AYAH = {
+                  "Verily, in the remembrance of Allah do hearts find rest. (Quran 13:28)",
+                  "Indeed, with hardship comes ease. Indeed, with hardship comes ease. (Quran 94:5-6)",
+                  "Allah does not burden a soul beyond what it can bear. (Quran 2:286)",
+                  "Do not despair of the mercy of Allah. Indeed, Allah forgives all sins. (Quran 39:53)",
+                  "So remember Me, and I will remember you. (Quran 2:152)",
+                  "Your Lord has not abandoned you, nor has He detested you. (Quran 93:3, said to the Prophet, peace be upon him)",
+                  "And whoever relies on Allah, He is enough for him. (Quran 65:3)",
+                  "And He is with you wherever you are. (Quran 57:4)",
+              };
+
+              static final String[] AFFIRM = {
+                  "You are allowed to be a work in progress and still be loved.",
+                  "Small steps still count. Showing up is already a win.",
+                  "You have gotten through every hard day you have had so far. That is a perfect record.",
+                  "Your worth was never tied to how productive or perfect you are.",
+                  "Be as gentle with yourself as you would be with a friend in your place.",
+                  "Good things are being built in you, slowly and quietly.",
+                  "Peace is not something you earn at the end of a good day. You can take some of it right now.",
+                  "You are capable of more than your worst day made you believe.",
+                  "Your effort matters, even when nobody sees it.",
+                  "Pick one thing today and do it well. That is enough.",
+                  "Success is made of the small habits you keep on ordinary days like today.",
+                  "You are doing better than you think you are.",
+                  "Whatever happened yesterday, today is a clean page.",
+                  "A calm mind, a steady heart, one small next step.",
+                  "You are not behind. You are on your own road, at your own pace.",
+                  "Wanting to grow is already a sign that you are growing.",
+                  "You deserve rest, and you deserve good things too.",
+                  "Your mistakes do not cancel your effort. Try again, softly.",
+              };
+
+              static final String[] STORY = {
+                  "Prophet Ayyub (peace be upon him) lost his health and his comfort for years. He said, \"Adversity has touched me, and You are the Most Merciful of those who show mercy\" (21:83). Allah restored him and called him an excellent servant (38:44). His pain was never a sign that Allah had left him.",
+                  "Prophet Yunus (peace be upon him) called out from the darkness of the night, the sea and the whale: \"There is no god but You, glory be to You, I was among the wrongdoers.\" Allah answered him and saved him (21:87-88). Even the darkest place was not outside of Allah's hearing.",
+                  "Prophet Yaqub (peace be upon him) lost his son Yusuf and grieved so much that his eyes turned white (12:84). He still said, \"Beautiful patience\" and \"I only complain of my sorrow and grief to Allah\" (12:83, 12:86). Years later he was reunited with his sons.",
+                  "Prophet Yusuf (peace be upon him) was thrown into a well by his own brothers, sold, falsely accused and jailed for years. Allah raised him to a place of honour (Surah Yusuf). The long road was part of the story, not the end of it.",
+                  "The Prophet (peace be upon him) went to Ta'if and was turned away and mocked. When the angel of the mountains offered to crush the town between two mountains, he refused, hoping Allah would bring believers from among them (Bukhari 3231). He carried more than most of us ever will, and Allah's love for him never changed.",
+                  "Maryam (peace be upon her) was alone and in pain, and Allah comforted her: \"Do not grieve, your Lord has provided beneath you a stream\" (19:24). She was not forgotten in her hardest hour.",
+              };
+
+              static int dayNumber() {
+                  return (int) (System.currentTimeMillis() / 86400000L);
+              }
+
+              // The "day" for the morning screen starts at 3 am, so a late night does not count as a new day.
+              private static String dayKey() {
+                  Calendar c = Calendar.getInstance();
+                  c.add(Calendar.HOUR_OF_DAY, -3);
+                  return c.get(Calendar.YEAR) + "-" + c.get(Calendar.DAY_OF_YEAR);
+              }
+
+              static boolean morningDue(Context c) {
+                  return !dayKey().equals(c.getSharedPreferences("sg2", Context.MODE_PRIVATE).getString("morning", ""));
+              }
+
+              static void markMorning(Context c) {
+                  c.getSharedPreferences("sg2", Context.MODE_PRIVATE).edit().putString("morning", dayKey()).apply();
+              }
+
+              // ---------- building the screen ----------
+
+              private static int dp(Context c, int v) {
+                  return (int) (v * c.getResources().getDisplayMetrics().density);
+              }
+
+              private static void title(Context c, LinearLayout body, String s) {
+                  TextView t = new TextView(c);
+                  t.setText(s);
+                  t.setTextSize(26);
+                  t.setTextColor(0xFFFFFFFF);
+                  t.setTypeface(null, Typeface.BOLD);
+                  t.setPadding(0, 0, 0, dp(c, 16));
+                  body.addView(t);
+              }
+
+              private static void section(Context c, LinearLayout body, String head, String text, String ref) {
+                  TextView h = new TextView(c);
+                  h.setText(head);
+                  h.setTextSize(13);
+                  h.setTextColor(0xFF9FB4D0);
+                  h.setTypeface(null, Typeface.BOLD);
+                  h.setPadding(0, dp(c, 18), 0, dp(c, 4));
+                  body.addView(h);
+                  TextView t = new TextView(c);
+                  t.setText(text);
+                  t.setTextSize(18);
+                  t.setTextColor(0xFFFFFFFF);
+                  t.setLineSpacing(0f, 1.15f);
+                  body.addView(t);
+                  if (ref != null) {
+                      TextView r = new TextView(c);
+                      r.setText(ref);
+                      r.setTextSize(14);
+                      r.setTextColor(0xFF9FB4D0);
+                      r.setPadding(0, dp(c, 4), 0, 0);
+                      body.addView(r);
+                  }
+              }
+
+              private static String pick(String[] a, int n) {
+                  return a[Math.floorMod(n, a.length)];
+              }
+
+              private static String[] pick(String[][] a, int n) {
+                  return a[Math.floorMod(n, a.length)];
+              }
+
+              static LinearLayout screen(Context c, int kind, View... bottom) {
+                  LinearLayout outer = new LinearLayout(c);
+                  outer.setOrientation(LinearLayout.VERTICAL);
+                  outer.setBackgroundColor(0xFF0F1B2D);
+                  outer.setPadding(dp(c, 20), dp(c, 48), dp(c, 20), dp(c, 20));
+
+                  ScrollView sv = new ScrollView(c);
+                  LinearLayout body = new LinearLayout(c);
+                  body.setOrientation(LinearLayout.VERTICAL);
+                  sv.addView(body);
+                  outer.addView(sv, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+                  int n = dayNumber();
+                  if (kind == TAHAJJUD) {
+                      String[] hd = pick(TAHAJJUD_HADITH, n);
+                      title(c, body, "Time for Tahajjud");
+                      section(c, body, "THE LAST THIRD OF THE NIGHT", hd[0], hd[1]);
+                      section(c, body, "A KIND WORD", pick(AFFIRM, n + 3), null);
+                      section(c, body, "REMEMBER ALLAH", pick(AYAH, n + 1), null);
+                  } else if (kind == FAJR) {
+                      String[] hd = pick(FAJR_HADITH, n);
+                      title(c, body, "Wake up for Fajr");
+                      section(c, body, "A REMINDER", hd[0], hd[1]);
+                      section(c, body, "A KIND WORD", pick(AFFIRM, n + 5), null);
+                      section(c, body, "REMEMBER ALLAH", pick(AYAH, n + 2), null);
+                  } else {
+                      String[] hd = pick(HADITH, n);
+                      title(c, body, "Good morning. Bismillah.");
+                      section(c, body, "A HADITH FOR YOU", hd[0], hd[1]);
+                      section(c, body, "REMEMBER ALLAH", pick(AYAH, n), null);
+                      section(c, body, "A KIND WORD", pick(AFFIRM, n) + "\n\n" + pick(AFFIRM, n + 7), null);
+                      section(c, body, "YOU ARE NOT THE FIRST TO BE TESTED", pick(STORY, n), "Being tested is not the same as being unloved.");
+                  }
+
+                  for (View v : bottom) outer.addView(v);
+                  return outer;
+              }
+          }
+          SGEOF
+          cat > app/src/main/assets/names.txt <<'SGEOF'
+          # Names to block in TikTok, Instagram and browser address bars. One per line, lowercase.
+          # A normal line matches anywhere in a name or search.
+          # A line starting with = must match the whole name or search (so "al huda" or "space" is not blocked).
+
+          # --- Huda ---
+          hudabeauty
+          huda beauty
+          hudakattan
+          huda kattan
+          hudamustafa
+          huda mustafa
+          =huda
+
+          # --- izna and its members ---
+          izna
+          choijungeun
+          choi jungeun
+          jungeun
+          bang jeemin
+          jeemin
+          ryu sarang
+          jeong saebi
+          yoon jiyoon
+          jiyoon
+          =mai
+          =koko
+          =sarang
+          =saebi
+
+          # --- Loop pages: add the exact page names here ---
+          =loop
+
+          # --- Love Island USA season 7 ---
+          love island
+          loveisland
+          ace greene
+          realacegreene
+          =ace
+          olandria
+          olandria carthen
+          x_0lan
+          x__0lan
+          nicolas vansteenberghe
+          vansteenberghe
+          chelley
+          bissainthe
+          yulissa
+          belle-a walker
+          austin shepard
+          jeremiah brown
+          taylor williams
+          cierra ortega
+          amaya espinal
+          iris kendall
+          hannah fields
+          jalen brown
+          chris seeley
+          elan bibas
+          jd dodard
+          zak srakaew
+          bryan arenales
+          jaden duggar
+          coco watson
+          gracyn blackmore
+          clarke carraway
+          vanna einerson
+          pepe garcia
+          =pepe
+          SGEOF
+      - name: Add adhan sound
+        run: |
+          if [ -f adhan.mp3 ]; then
+            mkdir -p app/src/main/res/raw
+            cp adhan.mp3 app/src/main/res/raw/adhan.mp3
+            echo "Using adhan.mp3"
+          else
+            echo "No adhan.mp3 in the repo, alarms will use the default alarm sound"
+          fi
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
