@@ -55,6 +55,7 @@ jobs:
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
               <uses-permission android:name="android.permission.WAKE_LOCK"/>
+              <uses-permission android:name="android.permission.VIBRATE"/>
               <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT"/>
               <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM"/>
               <uses-permission android:name="android.permission.USE_EXACT_ALARM"/>
@@ -301,6 +302,12 @@ jobs:
               }
 
               private void alarmStatus() {
+                  root.addView(text("Alarms: Tahajjud " + Scheduler.TAHAJJUD_H + ":" + String.format("%02d", Scheduler.TAHAJJUD_M) + " am, Fajr " + Scheduler.FAJR_H + ":" + String.format("%02d", Scheduler.FAJR_M) + " am.", 16, false));
+                  root.addView(button("Test the alarm now", v -> {
+                      Intent s = new Intent(this, AlarmService.class).putExtra("kind", Scheduler.FAJR);
+                      if (android.os.Build.VERSION.SDK_INT >= 26) startForegroundService(s);
+                      else startService(s);
+                  }));
                   if (android.os.Build.VERSION.SDK_INT >= 31) {
                       android.app.AlarmManager am = (android.app.AlarmManager) getSystemService(ALARM_SERVICE);
                       if (!am.canScheduleExactAlarms()) {
@@ -330,6 +337,7 @@ jobs:
                   root.addView(text(Schedule.isFreeDay(this)
                           ? "Today is a screen-time day. Blocking is paused (adult sites stay blocked)."
                           : "Screen-time days: the 2nd Saturday and the Sunday after it, every month.", 16, false));
+                  root.addView(text(Usage.describe(this), 16, false));
                   if (!accessibilityOn()) {
                       root.addView(text("Warning: the accessibility service is OFF, so nothing is being blocked right now. Turn it back on.", 16, true));
                       root.addView(button("Open Accessibility settings", v -> startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))));
@@ -438,6 +446,7 @@ jobs:
           import android.os.Build;
           import android.os.Handler;
           import android.os.Looper;
+          import android.os.PowerManager;
           import android.view.Gravity;
           import android.view.ViewGroup;
           import android.view.WindowManager;
@@ -529,6 +538,28 @@ jobs:
               private final Runnable check = new Runnable() {
                   @Override public void run() { runCheck(); }
               };
+              // Counts the time spent in Instagram and TikTok while the screen is on.
+              private long lastUse = 0;
+              private final Runnable usageTick = new Runnable() {
+                  @Override public void run() {
+                      try {
+                          long now = System.currentTimeMillis();
+                          long dt = lastUse == 0 ? 0 : Math.min(now - lastUse, 10000);
+                          lastUse = now;
+                          PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+                          if (dt > 0 && pm.isInteractive() && !Schedule.isFreeDay(GuardService.this)) {
+                              AccessibilityNodeInfo root = getRootInActiveWindow();
+                              CharSequence cp = root == null ? null : root.getPackageName();
+                              if (cp != null && isSocial(cp.toString())) {
+                                  Usage.add(GuardService.this, dt);
+                                  if (Usage.exceeded(GuardService.this)) kick("Daily limit reached for Instagram and TikTok");
+                              }
+                          }
+                      } catch (Exception ignored) { }
+                      h.postDelayed(this, 5000);
+                  }
+              };
+
               private final Runnable tick = new Runnable() {
                   @Override public void run() { runTick(); }
               };
@@ -547,6 +578,9 @@ jobs:
                       registerReceiver(unlock, new IntentFilter(Intent.ACTION_USER_PRESENT));
                   } catch (Exception ignored) { }
                   Scheduler.scheduleAll(this);
+                  lastUse = 0;
+                  h.removeCallbacks(usageTick);
+                  h.postDelayed(usageTick, 5000);
               }
 
               @Override
@@ -654,6 +688,10 @@ jobs:
                   if (isBrowser(p)) {
                       if (browserHit(root, p)) startWarning(p, true);
                   } else if (isSocial(p)) {
+                      if (!Schedule.isFreeDay(this) && Usage.exceeded(this)) {
+                          kick("Daily limit reached for Instagram and TikTok");
+                          return;
+                      }
                       if (socialHit(root)) startWarning(p, false);
                   }
               }
@@ -1058,6 +1096,9 @@ jobs:
           import android.app.PendingIntent;
           import android.content.Context;
           import android.content.Intent;
+          import android.media.AudioAttributes;
+          import android.media.RingtoneManager;
+          import android.net.Uri;
           import android.os.Build;
 
           import java.util.Calendar;
@@ -1071,6 +1112,7 @@ jobs:
 
               static final String ACT_RING = "com.siteguard.RING";
               static final String ACT_NOTICE = "com.siteguard.NOTICE";
+              static final String ACT_RETRY = "com.siteguard.RETRY";
 
               // Change these to move the alarms.
               static final int TAHAJJUD_H = 4, TAHAJJUD_M = 10;
@@ -1079,14 +1121,35 @@ jobs:
               static final int NOTICE_H = 20;
 
               static void scheduleAll(Context c) {
-                  setRing(c, TAHAJJUD, next(TAHAJJUD_H, TAHAJJUD_M), TAHAJJUD);
-                  setRing(c, FAJR, next(FAJR_H, FAJR_M), FAJR);
+                  setRing(c, TAHAJJUD, next(TAHAJJUD_H, TAHAJJUD_M), TAHAJJUD, ACT_RING);
+                  setRing(c, FAJR, next(FAJR_H, FAJR_M), FAJR, ACT_RING);
                   long n = nextNotice();
                   if (n > 0) setNotice(c, n);
               }
 
               static void snooze(Context c, int kind) {
-                  setRing(c, kind, System.currentTimeMillis() + 5 * 60 * 1000L, 100 + kind);
+                  setRing(c, kind, System.currentTimeMillis() + 5 * 60 * 1000L, 100 + kind, ACT_RING);
+              }
+
+              // While an alarm is ringing, a backup ring is lined up 3 minutes later. It is cancelled
+              // when you tap "I'm up" or snooze, so if the first ring fails or you sleep through it,
+              // it rings again, up to 6 more times.
+              static void scheduleRetry(Context c, int kind) {
+                  android.content.SharedPreferences p = c.getSharedPreferences("sg2", Context.MODE_PRIVATE);
+                  int n = p.getInt("retry" + kind, 0);
+                  if (n >= 6) return;
+                  p.edit().putInt("retry" + kind, n + 1).apply();
+                  setRing(c, kind, System.currentTimeMillis() + 3 * 60 * 1000L, 200 + kind, ACT_RETRY);
+              }
+
+              static void resetRetries(Context c, int kind) {
+                  c.getSharedPreferences("sg2", Context.MODE_PRIVATE).edit().putInt("retry" + kind, 0).apply();
+              }
+
+              static void cancelRetry(Context c, int kind) {
+                  resetRetries(c, kind);
+                  AlarmManager am = (AlarmManager) c.getSystemService(Context.ALARM_SERVICE);
+                  am.cancel(pi(c, kind, 200 + kind, ACT_RETRY));
               }
 
               private static long next(int h, int m) {
@@ -1122,9 +1185,9 @@ jobs:
                   return PendingIntent.getBroadcast(c, req, i, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
               }
 
-              private static void setRing(Context c, int kind, long at, int req) {
+              private static void setRing(Context c, int kind, long at, int req, String action) {
                   AlarmManager am = (AlarmManager) c.getSystemService(Context.ALARM_SERVICE);
-                  PendingIntent p = pi(c, kind, req, ACT_RING);
+                  PendingIntent p = pi(c, kind, req, action);
                   PendingIntent show = PendingIntent.getActivity(c, 50, new Intent(c, MainActivity.class),
                           PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
                   try {
@@ -1142,6 +1205,34 @@ jobs:
                   } catch (SecurityException e) {
                       am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, p);
                   }
+              }
+
+              // Used only if the alarm service cannot start: a loud alarm-style notification instead.
+              static void fallbackAlarm(Context c, int kind) {
+                  NotificationManager nm = c.getSystemService(NotificationManager.class);
+                  Uri sound = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM);
+                  int id = c.getResources().getIdentifier("adhan", "raw", c.getPackageName());
+                  if (id != 0) sound = Uri.parse("android.resource://" + c.getPackageName() + "/" + id);
+                  Notification.Builder b;
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      NotificationChannel ch = new NotificationChannel("alarm_backup", "Prayer alarms (backup)", NotificationManager.IMPORTANCE_HIGH);
+                      ch.setSound(sound, new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ALARM).build());
+                      ch.enableVibration(true);
+                      nm.createNotificationChannel(ch);
+                      b = new Notification.Builder(c, "alarm_backup");
+                  } else {
+                      b = new Notification.Builder(c).setSound(sound);
+                  }
+                  Intent open = new Intent(c, AlarmActivity.class).putExtra("kind", kind)
+                          .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                  PendingIntent pi = PendingIntent.getActivity(c, 8, open, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+                  b.setContentTitle(kind == FAJR ? "Time to wake up for Fajr" : "Time for Tahajjud")
+                   .setContentText("Tap to open")
+                   .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
+                   .setCategory(Notification.CATEGORY_ALARM)
+                   .setContentIntent(pi)
+                   .setFullScreenIntent(pi, true);
+                  nm.notify(4, b.build());
               }
 
               static void showNotice(Context c) {
@@ -1162,6 +1253,52 @@ jobs:
               }
           }
           SGEOF
+          cat > app/src/main/java/com/siteguard/Usage.java <<'SGEOF'
+          package com.siteguard;
+
+          import android.content.Context;
+          import android.content.SharedPreferences;
+
+          import java.util.Calendar;
+
+          /** Daily time limit for Instagram and TikTok together. */
+          final class Usage {
+              private Usage() { }
+
+              // Change this number to change the daily limit (hours x minutes x seconds x 1000).
+              static final long LIMIT_MS = 2L * 60 * 60 * 1000;
+
+              private static SharedPreferences p(Context c) {
+                  return c.getSharedPreferences("sg2", Context.MODE_PRIVATE);
+              }
+
+              private static String today() {
+                  Calendar c = Calendar.getInstance();
+                  return c.get(Calendar.YEAR) + "-" + c.get(Calendar.DAY_OF_YEAR);
+              }
+
+              static long used(Context c) {
+                  SharedPreferences sp = p(c);
+                  if (!today().equals(sp.getString("use_day", ""))) return 0;
+                  return sp.getLong("use_ms", 0);
+              }
+
+              static void add(Context c, long ms) {
+                  long now = used(c) + ms;
+                  p(c).edit().putString("use_day", today()).putLong("use_ms", now).apply();
+              }
+
+              static boolean exceeded(Context c) {
+                  return used(c) >= LIMIT_MS;
+              }
+
+              static String describe(Context c) {
+                  long u = used(c) / 60000;
+                  long l = LIMIT_MS / 60000;
+                  return "Instagram + TikTok today: " + (u / 60) + "h " + (u % 60) + "m of " + (l / 60) + "h " + (l % 60) + "m";
+              }
+          }
+          SGEOF
           cat > app/src/main/java/com/siteguard/AlarmReceiver.java <<'SGEOF'
           package com.siteguard;
 
@@ -1177,10 +1314,18 @@ jobs:
                   int kind = i.getIntExtra("kind", Scheduler.TAHAJJUD);
                   if (Scheduler.ACT_NOTICE.equals(a)) {
                       Scheduler.showNotice(c);
-                  } else if (Scheduler.ACT_RING.equals(a)) {
-                      Intent s = new Intent(c, AlarmService.class).putExtra("kind", kind);
-                      if (Build.VERSION.SDK_INT >= 26) c.startForegroundService(s);
-                      else c.startService(s);
+                  } else if (Scheduler.ACT_RING.equals(a) || Scheduler.ACT_RETRY.equals(a)) {
+                      // A fresh daily alarm starts the backup-ring count again.
+                      if (Scheduler.ACT_RING.equals(a)) Scheduler.resetRetries(c, kind);
+                      try {
+                          Intent s = new Intent(c, AlarmService.class).putExtra("kind", kind);
+                          if (Build.VERSION.SDK_INT >= 26) c.startForegroundService(s);
+                          else c.startService(s);
+                      } catch (Exception e) {
+                          // If the phone refuses to start the alarm service, still make noise.
+                          try { Scheduler.fallbackAlarm(c, kind); } catch (Exception ignored) { }
+                          Scheduler.scheduleRetry(c, kind);
+                      }
                   }
                   // Line up tomorrow's alarms.
                   Scheduler.scheduleAll(c);
@@ -1214,15 +1359,34 @@ jobs:
           import android.media.AudioAttributes;
           import android.media.AudioManager;
           import android.media.MediaPlayer;
+          import android.media.Ringtone;
           import android.media.RingtoneManager;
+          import android.net.Uri;
           import android.os.Build;
           import android.os.Handler;
           import android.os.IBinder;
           import android.os.Looper;
+          import android.os.PowerManager;
+          import android.os.VibrationEffect;
+          import android.os.Vibrator;
 
           public class AlarmService extends Service {
               private MediaPlayer mp;
+              private Ringtone ringtone;
+              private PowerManager.WakeLock wl;
+              private AudioManager audio;
               private final Handler h = new Handler(Looper.getMainLooper());
+
+              private final Runnable watch = new Runnable() {
+                  @Override public void run() {
+                      maxVolume();
+                      // If the sound died for any reason, start it again.
+                      boolean playing = false;
+                      try { playing = (mp != null && mp.isPlaying()) || (ringtone != null && ringtone.isPlaying()); } catch (Exception ignored) { }
+                      if (!playing) startSound();
+                      h.postDelayed(this, 3000);
+                  }
+              };
 
               @Override
               public IBinder onBind(Intent intent) { return null; }
@@ -1230,12 +1394,51 @@ jobs:
               @Override
               public int onStartCommand(Intent intent, int flags, int startId) {
                   int kind = intent == null ? Scheduler.TAHAJJUD : intent.getIntExtra("kind", Scheduler.TAHAJJUD);
-                  showNotification(kind);
-                  startSound();
+                  audio = (AudioManager) getSystemService(AUDIO_SERVICE);
+
+                  // Keep the phone awake while ringing.
+                  try {
+                      if (wl == null) {
+                          PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+                          wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "siteguard:alarm");
+                      }
+                      if (!wl.isHeld()) wl.acquire(16 * 60 * 1000L);
+                  } catch (Exception ignored) { }
+
+                  try { showNotification(kind); } catch (Exception ignored) { }
+                  maxVolume();
+                  boolean playing = false;
+                  try { playing = mp != null && mp.isPlaying(); } catch (Exception ignored) { }
+                  if (!playing) startSound();
+                  vibrate();
+
+                  // Backup ring in 3 minutes. Tapping "I'm up" or snooze cancels it.
+                  Scheduler.scheduleRetry(this, kind);
+
                   h.removeCallbacksAndMessages(null);
+                  h.postDelayed(watch, 3000);
                   // Stop by itself after 15 minutes if nobody answers.
                   h.postDelayed(() -> stopSelf(), 15 * 60 * 1000L);
                   return START_NOT_STICKY;
+              }
+
+              private void maxVolume() {
+                  try {
+                      if (audio == null) return;
+                      int max = audio.getStreamMaxVolume(AudioManager.STREAM_ALARM);
+                      if (audio.getStreamVolume(AudioManager.STREAM_ALARM) < max) {
+                          audio.setStreamVolume(AudioManager.STREAM_ALARM, max, 0);
+                      }
+                  } catch (Exception ignored) { }
+              }
+
+              private void vibrate() {
+                  try {
+                      Vibrator v = (Vibrator) getSystemService(VIBRATOR_SERVICE);
+                      long[] pattern = {0, 800, 600};
+                      if (Build.VERSION.SDK_INT >= 26) v.vibrate(VibrationEffect.createWaveform(pattern, 0));
+                      else v.vibrate(pattern, 0);
+                  } catch (Exception ignored) { }
               }
 
               private void showNotification(int kind) {
@@ -1267,38 +1470,66 @@ jobs:
                   } catch (Exception ignored) { }
               }
 
+              private AudioAttributes alarmAttrs() {
+                  return new AudioAttributes.Builder()
+                          .setUsage(AudioAttributes.USAGE_ALARM)
+                          .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                          .build();
+              }
+
               private void startSound() {
                   stopSound();
                   try {
-                      AudioManager am = (AudioManager) getSystemService(AUDIO_SERVICE);
-                      int max = am.getStreamMaxVolume(AudioManager.STREAM_ALARM);
-                      if (am.getStreamVolume(AudioManager.STREAM_ALARM) < max * 0.6) {
-                          am.setStreamVolume(AudioManager.STREAM_ALARM, (int) (max * 0.8), 0);
-                      }
+                      audio.requestAudioFocus(null, AudioManager.STREAM_ALARM, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT);
                   } catch (Exception ignored) { }
-                  mp = new MediaPlayer();
+                  // 1) the adhan, 2) the phone's default alarm sound, 3) the phone's ringtone player.
+                  if (playAdhan()) return;
+                  if (playDefault()) return;
                   try {
-                      mp.setAudioAttributes(new AudioAttributes.Builder()
-                              .setUsage(AudioAttributes.USAGE_ALARM)
-                              .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                              .build());
-                      int id = getResources().getIdentifier("adhan", "raw", getPackageName());
-                      if (id != 0) {
-                          AssetFileDescriptor afd = getResources().openRawResourceFd(id);
-                          mp.setDataSource(afd.getFileDescriptor(), afd.getStartOffset(), afd.getLength());
-                          afd.close();
-                      } else {
-                          mp.setDataSource(this, RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM));
-                      }
+                      ringtone = RingtoneManager.getRingtone(this, RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM));
+                      ringtone.setAudioAttributes(alarmAttrs());
+                      ringtone.play();
+                  } catch (Exception ignored) { }
+              }
+
+              private boolean playAdhan() {
+                  int id = getResources().getIdentifier("adhan", "raw", getPackageName());
+                  if (id == 0) return false;
+                  try {
+                      mp = new MediaPlayer();
+                      mp.setAudioAttributes(alarmAttrs());
+                      AssetFileDescriptor afd = getResources().openRawResourceFd(id);
+                      mp.setDataSource(afd.getFileDescriptor(), afd.getStartOffset(), afd.getLength());
+                      afd.close();
                       mp.setLooping(true);
+                      mp.setVolume(1f, 1f);
                       mp.prepare();
                       mp.start();
+                      return true;
                   } catch (Exception e) {
-                      stopSound();
+                      releasePlayer();
+                      return false;
                   }
               }
 
-              private void stopSound() {
+              private boolean playDefault() {
+                  try {
+                      mp = new MediaPlayer();
+                      mp.setAudioAttributes(alarmAttrs());
+                      Uri u = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM);
+                      mp.setDataSource(this, u);
+                      mp.setLooping(true);
+                      mp.setVolume(1f, 1f);
+                      mp.prepare();
+                      mp.start();
+                      return true;
+                  } catch (Exception e) {
+                      releasePlayer();
+                      return false;
+                  }
+              }
+
+              private void releasePlayer() {
                   if (mp != null) {
                       try { mp.stop(); } catch (Exception ignored) { }
                       try { mp.release(); } catch (Exception ignored) { }
@@ -1306,10 +1537,21 @@ jobs:
                   }
               }
 
+              private void stopSound() {
+                  releasePlayer();
+                  if (ringtone != null) {
+                      try { ringtone.stop(); } catch (Exception ignored) { }
+                      ringtone = null;
+                  }
+              }
+
               @Override
               public void onDestroy() {
                   h.removeCallbacksAndMessages(null);
                   stopSound();
+                  try { ((Vibrator) getSystemService(VIBRATOR_SERVICE)).cancel(); } catch (Exception ignored) { }
+                  try { audio.abandonAudioFocus(null); } catch (Exception ignored) { }
+                  try { if (wl != null && wl.isHeld()) wl.release(); } catch (Exception ignored) { }
                   super.onDestroy();
               }
           }
@@ -1318,6 +1560,7 @@ jobs:
           package com.siteguard;
 
           import android.app.Activity;
+          import android.app.NotificationManager;
           import android.content.Intent;
           import android.os.Bundle;
           import android.view.WindowManager;
@@ -1336,17 +1579,27 @@ jobs:
                   Button up = new Button(this);
                   up.setText("I'm up");
                   up.setOnClickListener(v -> {
-                      stopService(new Intent(this, AlarmService.class));
+                      Scheduler.cancelRetry(this, kind);
+                      stopRinging();
                       finish();
                   });
                   Button snooze = new Button(this);
                   snooze.setText("Snooze 5 minutes");
                   snooze.setOnClickListener(v -> {
+                      Scheduler.cancelRetry(this, kind);
                       Scheduler.snooze(this, kind);
-                      stopService(new Intent(this, AlarmService.class));
+                      stopRinging();
                       finish();
                   });
                   setContentView(Content.screen(this, kind, up, snooze));
+              }
+
+              private void stopRinging() {
+                  stopService(new Intent(this, AlarmService.class));
+                  try {
+                      NotificationManager nm = getSystemService(NotificationManager.class);
+                      nm.cancel(4);
+                  } catch (Exception ignored) { }
               }
 
               // The alarm cannot be dismissed with the back button. Tap "I'm up" or snooze.
